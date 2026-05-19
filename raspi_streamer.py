@@ -26,16 +26,19 @@ import rospy
 from geometry_msgs.msg import Twist
 
 # ---- INFERENCE MODE: "coral" or "remote" ----
-INFERENCE_MODE = "remote"
+INFERENCE_MODE = "coral"
+
+if INFERENCE_MODE == "coral":
+    import tflite_runtime.interpreter as tflite
 
 # Remote (5090) settings
 INFERENCE_HOST = "192.168.0.147"
 INFERENCE_PORT = 5556
 
 # Coral Edge TPU settings
-MODEL_PATH = os.path.expanduser("~/Desktop/19-06TT/best_ttball_full_integer_quant_edgetpu.tflite")
+MODEL_PATH = os.path.expanduser("~/Desktop/19-06TT/yolo11n_edgetpu.tflite")
 IMGSZ = 320
-CONF_THRESHOLD = 0.25
+CONF_THRESHOLD = 0.30
 CAMERA_DEVICE = "/dev/video1"
 
 SHM_FILE = "/dev/shm/ttball_frame.jpg"
@@ -189,10 +192,10 @@ def run_edgetpu_inference(interp, inp_detail, out_details, frame):
         cx, cy, bw, bh, conf = det[0], det[1], det[2], det[3], det[4]
         if conf < CONF_THRESHOLD:
             continue
-        x1 = int((cx - bw / 2) * w / IMGSZ)
-        y1 = int((cy - bh / 2) * h / IMGSZ)
-        x2 = int((cx + bw / 2) * w / IMGSZ)
-        y2 = int((cy + bh / 2) * h / IMGSZ)
+        x1 = int((cx - bw / 2) * w)
+        y1 = int((cy - bh / 2) * h)
+        x2 = int((cx + bw / 2) * w)
+        y2 = int((cy + bh / 2) * h)
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         detections.append([x1, y1, x2, y2, round(float(conf), 3)])
