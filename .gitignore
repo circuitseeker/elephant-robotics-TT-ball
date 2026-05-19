@@ -1,0 +1,11 @@
+*.tflite
+*.pt
+*.onnx
+__pycache__/
+*.pyc
+*.log
+runs/
+merged_dataset/
+ds1/
+ds2/
+mobilenet_ttball/
