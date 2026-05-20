@@ -68,9 +68,12 @@ BASE_ANGULAR = 1.0
 SLOW_ANGULAR = 0.4
 
 # Obstacle avoidance thresholds (mm)
-OBS_STOP = 250       # emergency stop
-OBS_SLOW = 500       # slow down
-OBS_TURN = 600       # start turning away
+OBS_STOP = 150       # emergency stop (very close)
+OBS_SLOW = 400       # slow down
+OBS_TURN = 550       # start turning away
+
+# Detection filtering
+MIN_DET_AREA = 0.004  # min bounding box as fraction of frame (filters chair wheels etc)
 
 # Explore settings
 EXPLORE_SPEED = 0.25
@@ -125,15 +128,14 @@ def get_best_direction():
 
 
 def is_path_clear_toward(norm_offset):
-    """Check if path toward ball (given by normalized camera offset) is clear."""
-    # Map camera offset to lidar sector
-    # Camera center = sector 0 (front), left = sector 11, right = sector 1
-    if abs(norm_offset) < 0.2:
-        sectors = [11, 0, 1]
-    elif norm_offset < 0:
-        sectors = [10, 11, 0]  # looking left
+    """Check if path toward ball (given by normalized camera offset) is clear.
+    Only checks the narrow sector in the ball's direction, not the whole front."""
+    if abs(norm_offset) < 0.3:
+        sectors = [0]           # dead ahead
+    elif norm_offset < -0.3:
+        sectors = [11]          # left
     else:
-        sectors = [0, 1, 2]    # looking right
+        sectors = [1]           # right
     return min(lidar_sectors[i] for i in sectors) > OBS_STOP
 
 
@@ -483,46 +485,49 @@ def run_control():
     DEAD_ZONE_X = 30
     CLOSE_AREA = 0.15
     MAX_ANGULAR = 0.6
-    CONF_THRESHOLD = 0.08
-    CONFIRM_FRAMES = 3
-    WINDOW_SIZE = 5
+    APPROACH_CONF = 0.45      # minimum conf to start approaching
+    CHASE_CONF_DROP = 0.25    # if conf drops this much from peak, it's fake
+    APPROACH_TIMEOUT = 15.0   # max seconds to approach before re-evaluating
     rate = rospy.Rate(10)
 
-    det_history = []
-    confirmed = False
+    # Approach state
+    approach_active = False
+    approach_peak_conf = 0.0
+    approach_frames = 0
+    approach_start_time = 0.0
+    conf_history = []
 
-    # Explore state machine: scan_turn → scan_look → (repeat 6x) → advance → scan_turn...
+    # Explore state machine
     explore_state = "scan_look"
     explore_timer = time.time()
     explore_turn_dir = 1.0
-    scan_step = 0               # 0-5 for 6 x 60° steps = 360°
+    scan_step = 0
     SCAN_STEPS = 6
-    SCAN_TURN_DURATION = 0.8    # time to turn ~60° at angular vel 1.3
-    SCAN_TURN_SPEED = 1.3       # rad/s for 60° turn
-    SCAN_LOOK_DURATION = 1.5    # pause to look for ball at each angle
-    ADVANCE_DURATION = 2.5      # drive forward to new position
-    ADVANCE_SPEED = 0.2         # m/s forward
-    advance_dir = 1.0           # which way to advance (use LiDAR)
+    SCAN_TURN_DURATION = 0.8
+    SCAN_TURN_SPEED = 1.3
+    SCAN_LOOK_DURATION = 1.5
+    ADVANCE_DURATION = 2.5
+    ADVANCE_SPEED = 0.2
+    advance_dir = 1.0
 
     while not rospy.is_shutdown():
-        # --- Manual commands always take priority ---
         cmd = manual_cmd
         if cmd:
             manual_cmd = None
             if cmd == "chase_on":
                 chase_enabled = True
-                det_history.clear()
-                confirmed = False
+                approach_active = False
+                approach_peak_conf = 0.0
+                approach_frames = 0
                 scan_step = 0
                 explore_state = "scan_look"
                 explore_timer = time.time()
                 stats["mode"] = "explore"
-                print("Chase ON — starting 360° scan")
+                print("Chase ON -- starting 360 scan")
             elif cmd == "chase_off":
                 chase_enabled = False
+                approach_active = False
                 stop_robot()
-                det_history.clear()
-                confirmed = False
                 stats["mode"] = "idle"
                 print("Chase OFF")
             elif cmd.startswith("speed:"):
@@ -540,56 +545,96 @@ def run_control():
             rate.sleep()
             continue
 
-        # --- Check for ball detections ---
+        # --- Get detections, filter by confidence only (0.45 handles chair wheels) ---
         dets = last_dets
-        good_dets = [d for d in dets if len(d) > 4 and d[4] >= CONF_THRESHOLD]
+        good_dets = [d for d in dets if len(d) > 4 and d[4] >= APPROACH_CONF]
 
-        # Always track detection history
-        det_history.append(len(good_dets) > 0)
-        if len(det_history) > WINDOW_SIZE:
-            det_history.pop(0)
-        hits = sum(det_history)
+        # Pick best detection by confidence (no obstacle filter here)
+        best = None
+        best_conf = 0.0
+        if good_dets:
+            best = max(good_dets, key=lambda d: d[4])
+            best_conf = best[4]
 
         front = get_front_clearance()
 
-        # ===== OBSTACLE EMERGENCY STOP =====
-        if front < OBS_STOP and confirmed:
-            stop_robot()
-            stats["mode"] = "obstacle"
-            rate.sleep()
-            continue
-
-        # ===== CONFIRMED: CHASE MODE =====
-        if confirmed:
-            if hits < 2:
-                confirmed = False
+        # ===== APPROACH MODE: moving toward a potential ball =====
+        if approach_active:
+            # Timeout: if approaching too long without reaching, re-scan
+            if time.time() - approach_start_time > APPROACH_TIMEOUT:
+                approach_active = False
                 stop_robot()
-                det_history.clear()
+                conf_history.clear()
                 scan_step = 0
                 explore_state = "scan_look"
                 explore_timer = time.time()
                 stats["mode"] = "explore"
-                print("Ball lost → scanning 360°")
+                print(f"Approach timeout -> re-scanning")
                 rate.sleep()
                 continue
 
-            if not good_dets:
+            if best is None:
+                # Lost sight completely
+                approach_active = False
                 stop_robot()
+                conf_history.clear()
+                scan_step = 0
+                explore_state = "scan_look"
+                explore_timer = time.time()
+                stats["mode"] = "explore"
+                print(f"Ball lost during approach -> scanning")
                 rate.sleep()
                 continue
 
+            # Smoothed confidence tracking
+            conf_history.append(best_conf)
+            if len(conf_history) > 10:
+                conf_history.pop(0)
+            avg_conf = sum(conf_history) / len(conf_history)
+
+            if best_conf > approach_peak_conf:
+                approach_peak_conf = best_conf
+            approach_frames += 1
+
+            # After 15+ frames, check if smoothed conf is dropping significantly
+            if approach_frames > 15 and avg_conf < (approach_peak_conf - CHASE_CONF_DROP):
+                approach_active = False
+                stop_robot()
+                conf_history.clear()
+                scan_step = 0
+                explore_state = "scan_look"
+                explore_timer = time.time()
+                stats["mode"] = "explore"
+                print(f"Conf dropping (avg={avg_conf:.2f} < peak {approach_peak_conf:.2f}) -> fake, scanning")
+                rate.sleep()
+                continue
+
+            # Check if obstacle is blocking the path to the ball while driving
+            ball_offset = ((best[0] + best[2]) / 2 - FRAME_CX) / (FRAME_W / 2)
+            if not is_path_clear_toward(ball_offset) and front < OBS_STOP:
+                approach_active = False
+                stop_robot()
+                scan_step = 0
+                explore_state = "scan_look"
+                explore_timer = time.time()
+                stats["mode"] = "explore"
+                print(f"Path blocked during approach -> scanning for another")
+                rate.sleep()
+                continue
+
+            # All good - chase the ball
             stats["mode"] = "chase"
-            best = max(good_dets, key=lambda d: (d[2] - d[0]) * (d[3] - d[1]))
             x1, y1, x2, y2 = best[:4]
             bcx = (x1 + x2) // 2
             ball_area = ((x2 - x1) * (y2 - y1)) / (FRAME_W * FRAME_H)
 
             if ball_area >= CLOSE_AREA:
                 stop_robot()
-                print("Ball reached! Pausing 3s then exploring...")
+                print(f"Ball reached! (conf={best_conf:.2f}, peak={approach_peak_conf:.2f})")
                 time.sleep(3)
-                det_history.clear()
-                confirmed = False
+                approach_active = False
+                approach_peak_conf = 0.0
+                approach_frames = 0
                 scan_step = 0
                 explore_state = "scan_look"
                 explore_timer = time.time()
@@ -605,38 +650,37 @@ def run_control():
             if abs(offset_x) < DEAD_ZONE_X:
                 az = 0.0
 
-            # Slow down if obstacle ahead during chase
             speed_scale = 1.0
             if front < OBS_SLOW:
                 speed_scale = 0.3
             elif front < OBS_TURN:
                 speed_scale = 0.6
 
-            if not is_path_clear_toward(norm_offset):
-                speed_scale = 0.2
-
             fwd = BASE_LINEAR * s * max(0.3, 1.0 - abs(norm_offset)) * speed_scale
             publish_twist(fwd, 0, az)
             rate.sleep()
             continue
 
-        # ===== NOT CONFIRMED: check if we should confirm =====
-        if hits >= CONFIRM_FRAMES:
-            confirmed = True
-            print(f"Ball confirmed ({hits}/{WINDOW_SIZE}) → chasing!")
+        # ===== NOT APPROACHING: check if we should start =====
+        if best is not None and best_conf >= APPROACH_CONF:
+            approach_active = True
+            approach_peak_conf = best_conf
+            approach_frames = 0
+            approach_start_time = time.time()
+            conf_history.clear()
+            print(f"Ball spotted (conf={best_conf:.2f}) -> approaching to verify")
             stats["mode"] = "chase"
             rate.sleep()
             continue
 
-        # ===== EXPLORE MODE — systematic 360° scan then advance =====
+        # ===== EXPLORE MODE -- systematic 360 scan then advance =====
         now = time.time()
         elapsed = now - explore_timer
 
         if explore_state == "scan_look":
             stop_robot()
-            stats["mode"] = "confirm" if hits > 0 else "explore"
+            stats["mode"] = "explore"
             if elapsed >= SCAN_LOOK_DURATION:
-                # Time's up — either confirmed (handled above) or move on
                 if scan_step < SCAN_STEPS:
                     explore_state = "scan_turn"
                     explore_timer = now
@@ -645,7 +689,7 @@ def run_control():
                     explore_state = "advance"
                     explore_timer = now
                     advance_dir = get_best_direction()
-                    print("360° scan complete, no ball → advancing")
+                    print("360 scan complete, no ball -> advancing")
 
         elif explore_state == "scan_turn":
             stats["mode"] = "explore"
@@ -655,7 +699,6 @@ def run_control():
                 scan_step += 1
                 explore_state = "scan_look"
                 explore_timer = now
-                det_history.clear()
                 print(f"Scan step {scan_step}/{SCAN_STEPS}")
 
         elif explore_state == "advance":
@@ -666,7 +709,7 @@ def run_control():
                 explore_timer = now
                 scan_step = 0
                 explore_turn_dir = get_best_direction()
-                print("Obstacle during advance → new scan")
+                print("Obstacle during advance -> new scan")
             elif front < OBS_TURN:
                 az = get_best_direction() * 0.4
                 publish_twist(ADVANCE_SPEED * 0.4, 0, az)
@@ -678,8 +721,7 @@ def run_control():
                 scan_step = 0
                 explore_state = "scan_look"
                 explore_timer = now
-                det_history.clear()
-                print("Reached new position → scanning 360°")
+                print("Reached new position -> scanning 360")
 
         rate.sleep()
 
