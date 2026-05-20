@@ -1,0 +1,17 @@
+description: Ultralytics YOLO11s model trained on /home/helium5090/Desktop/19-06TT/merged_dataset/data.yaml
+author: Ultralytics
+date: '2026-05-19T16:23:10.818434'
+version: 8.4.24
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+batch: 1
+imgsz:
+- 320
+- 320
+names:
+  0: ping_pong_ball
+args: {}
+channels: 3
+end2end: false
