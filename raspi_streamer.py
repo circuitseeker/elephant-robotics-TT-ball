@@ -36,10 +36,11 @@ INFERENCE_HOST = "192.168.0.147"
 INFERENCE_PORT = 5556
 
 # Coral Edge TPU settings
-MODEL_PATH = os.path.expanduser("~/Desktop/19-06TT/yolo11n_edgetpu.tflite")
+MODEL_PATH = os.path.expanduser("~/Desktop/19-06TT/yolo11n_qat_edgetpu.tflite")
+MODEL_TYPE = "yolo"
 IMGSZ = 320
-CONF_THRESHOLD = 0.30
-CAMERA_DEVICE = "/dev/video1"
+CONF_THRESHOLD = 0.10
+CAMERA_DEVICE = "/dev/video0"
 
 SHM_FILE = "/dev/shm/ttball_frame.jpg"
 STATS_FILE = "/dev/shm/ttball_stats.json"
@@ -170,13 +171,36 @@ def run_edgetpu_inference(interp, inp_detail, out_details, frame):
     if inp_detail['dtype'] == np.uint8:
         inp_data = img.astype(np.uint8)
     elif inp_detail['dtype'] == np.int8:
-        inp_data = (img.astype(np.int32) - 128).astype(np.int8)
+        scale, zp = inp_detail['quantization']
+        inp_data = ((img.astype(np.float32) / 255.0 / scale) + zp).astype(np.int8)
     else:
         inp_data = (img.astype(np.float32) / 255.0)
 
     interp.set_tensor(inp_detail['index'], np.expand_dims(inp_data, 0))
     interp.invoke()
 
+    if MODEL_TYPE == "mobilenet":
+        # MobileNet SSD: outputs [1,1] confidence + [1,4] bbox (cx,cy,w,h normalized)
+        conf_val = None
+        box_val = None
+        for o in out_details:
+            val = interp.get_tensor(o['index'])[0]
+            if val.shape == (1,):
+                conf_val = float(val[0])
+            elif val.shape == (4,):
+                box_val = val.astype(np.float32)
+        if conf_val is None or box_val is None or conf_val < CONF_THRESHOLD:
+            return []
+        cx, cy, bw, bh = box_val
+        x1 = int((cx - bw / 2) * w)
+        y1 = int((cy - bh / 2) * h)
+        x2 = int((cx + bw / 2) * w)
+        y2 = int((cy + bh / 2) * h)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        return [[x1, y1, x2, y2, round(conf_val, 3)]]
+
+    # YOLO mode: output [1,5,2100] -> [2100,5] (cx,cy,w,h,conf)
     raw = interp.get_tensor(out_details[0]['index'])
     out_q = out_details[0]
     if out_q['dtype'] != np.float32:
@@ -237,7 +261,7 @@ def run_lidar():
 
     while True:
         try:
-            lidar = RPLidar('/dev/ttyUSB1', baudrate=256000, timeout=3)
+            lidar = RPLidar('/dev/ttyUSB0', baudrate=256000, timeout=3)
             _lidar_instance = lidar
             info = lidar.get_info()
             print(f"LiDAR connected: model={info['model']}, fw={info['firmware']}")
@@ -459,21 +483,26 @@ def run_control():
     DEAD_ZONE_X = 30
     CLOSE_AREA = 0.15
     MAX_ANGULAR = 0.6
-    CONF_THRESHOLD = 0.4
-    CONFIRM_FRAMES = 5
-    WINDOW_SIZE = 7
+    CONF_THRESHOLD = 0.08
+    CONFIRM_FRAMES = 3
+    WINDOW_SIZE = 5
     rate = rospy.Rate(10)
 
     det_history = []
     confirmed = False
 
-    # Explore state
-    explore_state = "drive"     # drive, turn, pause_look
+    # Explore state machine: scan_turn → scan_look → (repeat 6x) → advance → scan_turn...
+    explore_state = "scan_look"
     explore_timer = time.time()
     explore_turn_dir = 1.0
-    DRIVE_DURATION = 2.0        # drive forward for 2s
-    TURN_DURATION = 1.5         # turn for ~60 deg
-    LOOK_DURATION = 1.0         # pause and look for ball
+    scan_step = 0               # 0-5 for 6 x 60° steps = 360°
+    SCAN_STEPS = 6
+    SCAN_TURN_DURATION = 0.8    # time to turn ~60° at angular vel 1.3
+    SCAN_TURN_SPEED = 1.3       # rad/s for 60° turn
+    SCAN_LOOK_DURATION = 1.5    # pause to look for ball at each angle
+    ADVANCE_DURATION = 2.5      # drive forward to new position
+    ADVANCE_SPEED = 0.2         # m/s forward
+    advance_dir = 1.0           # which way to advance (use LiDAR)
 
     while not rospy.is_shutdown():
         # --- Manual commands always take priority ---
@@ -484,10 +513,11 @@ def run_control():
                 chase_enabled = True
                 det_history.clear()
                 confirmed = False
-                explore_state = "pause_look"
+                scan_step = 0
+                explore_state = "scan_look"
                 explore_timer = time.time()
                 stats["mode"] = "explore"
-                print("Chase ON — starting explore")
+                print("Chase ON — starting 360° scan")
             elif cmd == "chase_off":
                 chase_enabled = False
                 stop_robot()
@@ -499,9 +529,10 @@ def run_control():
                 speed_mult = float(cmd.split(":")[1])
                 print(f"Speed: {speed_mult:.0%}")
             elif cmd in ("forward", "backward", "left", "right", "crab_left", "crab_right", "stop"):
-                lx, ly, az = get_cmd_twist(cmd)
-                publish_twist(lx, ly, az)
-                stats["mode"] = "manual"
+                if not chase_enabled:
+                    lx, ly, az = get_cmd_twist(cmd)
+                    publish_twist(lx, ly, az)
+                    stats["mode"] = "manual"
             rate.sleep()
             continue
 
@@ -534,10 +565,11 @@ def run_control():
                 confirmed = False
                 stop_robot()
                 det_history.clear()
-                explore_state = "pause_look"
+                scan_step = 0
+                explore_state = "scan_look"
                 explore_timer = time.time()
                 stats["mode"] = "explore"
-                print("Ball lost → exploring")
+                print("Ball lost → scanning 360°")
                 rate.sleep()
                 continue
 
@@ -558,7 +590,8 @@ def run_control():
                 time.sleep(3)
                 det_history.clear()
                 confirmed = False
-                explore_state = "drive"
+                scan_step = 0
+                explore_state = "scan_look"
                 explore_timer = time.time()
                 stats["mode"] = "explore"
                 rate.sleep()
@@ -595,57 +628,58 @@ def run_control():
             rate.sleep()
             continue
 
-        # If we see some detections, pause to confirm
-        if hits > 0 and explore_state != "pause_look":
-            explore_state = "pause_look"
-            explore_timer = time.time()
-            stats["mode"] = "confirm"
-
-        # ===== EXPLORE MODE — roam with LiDAR =====
+        # ===== EXPLORE MODE — systematic 360° scan then advance =====
         now = time.time()
         elapsed = now - explore_timer
 
-        if explore_state == "pause_look":
-            # Stand still, let camera check for ball
+        if explore_state == "scan_look":
             stop_robot()
             stats["mode"] = "confirm" if hits > 0 else "explore"
-            if elapsed >= LOOK_DURATION:
-                if hits == 0:
-                    # Nothing found, pick direction and drive
-                    explore_state = "turn"
+            if elapsed >= SCAN_LOOK_DURATION:
+                # Time's up — either confirmed (handled above) or move on
+                if scan_step < SCAN_STEPS:
+                    explore_state = "scan_turn"
                     explore_timer = now
-                    # Turn toward most open LiDAR sector
-                    explore_turn_dir = get_best_direction()
+                else:
+                    scan_step = 0
+                    explore_state = "advance"
+                    explore_timer = now
+                    advance_dir = get_best_direction()
+                    print("360° scan complete, no ball → advancing")
 
-        elif explore_state == "turn":
+        elif explore_state == "scan_turn":
             stats["mode"] = "explore"
-            publish_twist(0, 0, explore_turn_dir)
-            if elapsed >= TURN_DURATION:
-                explore_state = "drive"
-                explore_timer = now
+            publish_twist(0, 0, SCAN_TURN_SPEED)
+            if elapsed >= SCAN_TURN_DURATION:
                 stop_robot()
+                scan_step += 1
+                explore_state = "scan_look"
+                explore_timer = now
+                det_history.clear()
+                print(f"Scan step {scan_step}/{SCAN_STEPS}")
 
-        elif explore_state == "drive":
+        elif explore_state == "advance":
             stats["mode"] = "explore"
             if front < OBS_STOP:
-                # Too close — stop and turn
                 stop_robot()
-                explore_state = "turn"
+                explore_state = "scan_turn"
                 explore_timer = now
+                scan_step = 0
                 explore_turn_dir = get_best_direction()
+                print("Obstacle during advance → new scan")
             elif front < OBS_TURN:
-                # Getting close — slow down and start turning
-                az = get_best_direction() * 0.5
-                publish_twist(EXPLORE_SPEED * 0.4, 0, az)
+                az = get_best_direction() * 0.4
+                publish_twist(ADVANCE_SPEED * 0.4, 0, az)
             else:
-                # Clear path — drive forward
-                publish_twist(EXPLORE_SPEED, 0, 0)
+                publish_twist(ADVANCE_SPEED, 0, 0)
 
-            if elapsed >= DRIVE_DURATION:
-                explore_state = "pause_look"
-                explore_timer = now
+            if elapsed >= ADVANCE_DURATION:
                 stop_robot()
+                scan_step = 0
+                explore_state = "scan_look"
+                explore_timer = now
                 det_history.clear()
+                print("Reached new position → scanning 360°")
 
         rate.sleep()
 
@@ -803,14 +837,20 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == '/stream':
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
-            while True:
+            self.connection.settimeout(5)
+            last_jpg = None
+            for _ in range(9000):
                 try:
                     with open(SHM_FILE, 'rb') as f:
                         jpg = f.read()
-                    if jpg:
-                        self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n')
-                    time.sleep(0.04)
+                    if jpg and jpg != last_jpg:
+                        self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                                         + str(len(jpg)).encode() + b'\r\n\r\n' + jpg + b'\r\n')
+                        self.wfile.flush()
+                        last_jpg = jpg
+                    time.sleep(0.05)
                 except:
                     break
 
